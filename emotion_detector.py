@@ -1,23 +1,29 @@
 """
-emotion_detector.py - Emotion Detection Module for The Empathy Engine
+emotion_detector.py - Emotion Detection via HuggingFace Inference API
 
-Uses a pretrained HuggingFace Transformers model (DistilBERT fine-tuned on the
-emotion dataset) to classify the dominant emotional tone of incoming text.
+Sends text to the HuggingFace hosted Inference API using the model:
+    j-hartmann/emotion-english-distilroberta-base
 
-Pipeline:
-  raw text → tokenisation → transformer inference → top-label extraction
-           → canonical label normalisation → EmotionResult dataclass
+This model classifies text into 7 emotions:
+    anger | disgust | fear | joy | neutral | sadness | surprise
+
+These are then normalised to the 5 canonical emotions the system uses:
+    happy | sad | angry | concerned | neutral
+
+No local model download required — all inference runs on HuggingFace servers.
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from transformers import pipeline, Pipeline
+import requests
 
 import config
 
 logger = logging.getLogger(__name__)
+
 
 # ─────────────────────────────────────────────
 # Data Schema
@@ -29,73 +35,72 @@ class EmotionResult:
     Represents the output of the emotion detection step.
 
     Attributes:
-        emotion     – one of the 5 canonical emotions the system understands
+        emotion     – one of 5 canonical emotions: happy | sad | angry | concerned | neutral
         confidence  – model confidence score in [0, 1]
-        raw_label   – the original label returned by the HF model (for logging)
-        all_scores  – full probability distribution over all raw labels (bonus)
+        raw_label   – the original label returned by the HF model (before normalisation)
+        all_scores  – full probability distribution over canonical emotions (for UI chart)
     """
-    emotion: str
+    emotion:    str
     confidence: float
-    raw_label: str
+    raw_label:  str
     all_scores: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
-            "emotion": self.emotion,
+            "emotion":    self.emotion,
             "confidence": round(self.confidence, 4),
-            "raw_label": self.raw_label,
+            "raw_label":  self.raw_label,
             "all_scores": {k: round(v, 4) for k, v in self.all_scores.items()},
         }
 
 
 # ─────────────────────────────────────────────
-# Classifier Singleton
+# Emotion Detector
 # ─────────────────────────────────────────────
 
 class EmotionDetector:
     """
-    Wraps a HuggingFace text-classification pipeline.
+    Calls the HuggingFace Inference API to classify text emotions.
 
-    The model is loaded once at instantiation (lazy if you prefer) and reused
-    for every subsequent call – important so the large model weights are not
-    re-loaded on each request.
+    Uses model: j-hartmann/emotion-english-distilroberta-base
+    Endpoint:   https://api-inference.huggingface.co/models/<model>
+
+    The API key is read from config.HUGGINGFACE_API_KEY (env var).
+    If no key is set, HF allows a limited number of free calls per hour.
     """
 
-    def __init__(self, model_name: str = config.EMOTION_MODEL_NAME) -> None:
-        self.model_name = model_name
-        self._classifier: Optional[Pipeline] = None
-        logger.info(f"EmotionDetector initialised with model: {model_name}")
+    def __init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Content-Type": "application/json",
+        })
+        # Attach the API key only if available
+        if config.HUGGINGFACE_API_KEY:
+            self._session.headers["Authorization"] = (
+                f"Bearer {config.HUGGINGFACE_API_KEY}"
+            )
+            logger.info("HuggingFace API key loaded.")
+        else:
+            logger.warning(
+                "HUGGINGFACE_API_KEY not set — using unauthenticated access "
+                "(rate-limited). Set the key in your .env file for production use."
+            )
+        logger.info(
+            f"EmotionDetector ready. Model: {config.EMOTION_MODEL_NAME}"
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _load_model(self) -> None:
-        """Load (or reload) the HF pipeline. Safe to call multiple times."""
-        logger.info(f"Loading HuggingFace model '{self.model_name}' …")
-        self._classifier = pipeline(
-            task="text-classification",
-            model=self.model_name,
-            top_k=None,          # return ALL label scores for the bonus viz
-            truncation=True,
-            max_length=512,
-        )
-        logger.info("Model loaded successfully.")
-
-    @property
-    def classifier(self) -> Pipeline:
-        """Lazy-load the model on first access."""
-        if self._classifier is None:
-            self._load_model()
-        return self._classifier
-
     def _normalise_label(self, raw_label: str) -> str:
         """
-        Map raw HuggingFace label → one of the 5 canonical system emotions.
+        Map a raw HuggingFace label → one of the 5 canonical system emotions.
 
-        The DistilBERT emotion model uses labels like 'sadness', 'joy', etc.
-        We standardise these so the rest of the pipeline always works with
-        the same restricted vocabulary.
+        Example:
+            "joy"     → "happy"
+            "sadness" → "sad"
+            "fear"    → "concerned"
         """
         normalised = config.EMOTION_LABEL_MAP.get(raw_label.lower())
         if normalised is None:
@@ -106,49 +111,98 @@ class EmotionDetector:
             return config.DEFAULT_EMOTION
         return normalised
 
+    def _call_hf_api(self, text: str) -> list[dict]:
+        """
+        POST to the HuggingFace Inference API and return the list of
+        {label, score} dicts sorted by score descending.
+
+        Handles the model loading wait (503 → retry once after warm-up).
+        """
+        payload = {
+            "inputs": text,
+            "parameters": {"return_all_scores": True},
+            "options":    {"wait_for_model": True},
+        }
+
+        for attempt in range(3):
+            try:
+                resp = self._session.post(
+                    config.HF_INFERENCE_URL,
+                    json=payload,
+                    timeout=30,
+                )
+
+                # Model is still loading — wait and retry
+                if resp.status_code == 503:
+                    estimated_wait = resp.json().get("estimated_time", 20)
+                    wait_sec = min(float(estimated_wait), 30)
+                    logger.info(
+                        f"HF model loading, waiting {wait_sec:.0f}s … "
+                        f"(attempt {attempt + 1}/3)"
+                    )
+                    time.sleep(wait_sec)
+                    continue
+
+                resp.raise_for_status()
+
+                # HF returns: [[{label, score}, …]] (list-of-lists)
+                raw: list = resp.json()
+                scores: list[dict] = raw[0] if isinstance(raw[0], list) else raw
+                return sorted(scores, key=lambda x: x["score"], reverse=True)
+
+            except requests.RequestException as exc:
+                logger.error(f"HuggingFace API request failed (attempt {attempt + 1}): {exc}")
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"HuggingFace Inference API call failed after 3 attempts: {exc}"
+                    ) from exc
+                time.sleep(2 ** attempt)   # exponential back-off
+
+        raise RuntimeError("HuggingFace API did not respond after retries.")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def detect(self, text: str) -> EmotionResult:
         """
-        Analyse *text* and return an EmotionResult.
+        Analyse text and return an EmotionResult.
 
         Args:
             text: The input sentence / paragraph to classify.
 
         Returns:
-            EmotionResult with the dominant canonical emotion and confidence.
+            EmotionResult with the dominant canonical emotion and confidence score.
 
         Raises:
-            ValueError: If text is empty or only whitespace.
+            ValueError:   If text is empty or only whitespace.
+            RuntimeError: If the HuggingFace API call fails.
         """
         text = text.strip()
         if not text:
             raise ValueError("Input text must not be empty.")
 
-        logger.debug(f"Detecting emotion for: '{text[:80]}{'…' if len(text) > 80 else ''}'")
+        logger.debug(
+            f"Detecting emotion via HF API: "
+            f"'{text[:80]}{'…' if len(text) > 80 else ''}'"
+        )
 
-        # Run inference – returns a list-of-lists when top_k=None
-        raw_output: list[list[dict]] = self.classifier(text)  # type: ignore[arg-type]
+        # Call HuggingFace Inference API
+        scores_sorted = self._call_hf_api(text)
 
-        # Flatten: pipeline(top_k=None) → [[{label, score}, …]]
-        scores: list[dict] = raw_output[0] if isinstance(raw_output[0], list) else raw_output
-
-        # Sort descending by score
-        scores_sorted = sorted(scores, key=lambda x: x["score"], reverse=True)
-        top = scores_sorted[0]
-
-        raw_label: str  = top["label"]
+        # Top prediction
+        top            = scores_sorted[0]
+        raw_label: str = top["label"]
         confidence: float = top["score"]
-        canonical: str  = self._normalise_label(raw_label)
+        canonical: str = self._normalise_label(raw_label)
 
-        # Build the full score map keyed by *canonical* labels for visualisation
+        # Build canonical score map (sum scores that map to the same canonical label)
         canonical_scores: dict[str, float] = {}
         for entry in scores_sorted:
             c_label = self._normalise_label(entry["label"])
-            # Accumulate scores when multiple raw labels map to the same canonical
-            canonical_scores[c_label] = canonical_scores.get(c_label, 0.0) + entry["score"]
+            canonical_scores[c_label] = (
+                canonical_scores.get(c_label, 0.0) + entry["score"]
+            )
 
         result = EmotionResult(
             emotion=canonical,
@@ -158,14 +212,14 @@ class EmotionDetector:
         )
 
         logger.info(
-            f"Emotion detected: '{canonical}' (confidence={confidence:.2%}, "
-            f"raw='{raw_label}')"
+            f"Emotion detected: '{canonical}' "
+            f"(confidence={confidence:.2%}, raw='{raw_label}')"
         )
         return result
 
 
 # ─────────────────────────────────────────────
-# Module-level singleton (imported by other modules)
+# Module-level singleton (imported by app.py)
 # ─────────────────────────────────────────────
 emotion_detector = EmotionDetector()
 

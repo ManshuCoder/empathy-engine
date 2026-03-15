@@ -1,17 +1,18 @@
 """
-app.py - FastAPI Server for The Empathy Engine
+app.py - FastAPI Server for The Empathy Engine v2.0
 
-This is the entry point and web server for the service.
+Pipeline per request:
+  1. Receive text via POST /generate-voice
+  2. Detect emotion via HuggingFace Inference API  (emotion_detector.py)
+  3. Map emotion → voice parameters               (voice_mapper.py)
+  4. Synthesise speech via ElevenLabs API          (tts_engine.py)
+  5. Return audio URL + full metadata
 
 Endpoints:
-  POST /generate-voice   → full emotion detection + TTS pipeline
-  GET  /emotion-map      → returns the emotion → voice-param mapping table
+  POST /generate-voice   → full pipeline
+  GET  /emotion-map      → emotion → voice-param reference table
   GET  /health           → liveness probe
-  GET  /                 → serves the web UI (index.html)
-
-Static Assets:
-  /static/generated_audio/  → generated audio files
-  /static/                  → UI assets (HTML, CSS, JS)
+  GET  /                 → web UI (static/index.html)
 """
 
 import logging
@@ -31,7 +32,7 @@ from tts_engine import tts_engine
 from voice_mapper import voice_mapper
 
 # ─────────────────────────────────────────────
-# Logging setup
+# Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +52,6 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Allow cross-origin requests (needed when the frontend is on a different port)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,7 +59,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static files (generated audio + frontend assets)
 app.mount(
     "/static",
     StaticFiles(directory=str(config.STATIC_DIR)),
@@ -78,13 +77,13 @@ class GenerateVoiceRequest(BaseModel):
         min_length=1,
         max_length=5000,
         description="The text to convert to speech.",
-        examples=["I can't believe this happened. It's absolutely devastating."],
+        examples=["I can't believe this happened. I'm really upset."],
     )
     voice_style: str | None = Field(
         default=None,
         description=(
-            "Override the auto-detected emotion. "
-            "One of: happy, sad, angry, concerned, neutral"
+            "Override auto-detected emotion. "
+            "One of: happy | sad | angry | concerned | neutral"
         ),
     )
     provider: str | None = Field(
@@ -105,35 +104,36 @@ class GenerateVoiceRequest(BaseModel):
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, v: str | None) -> str | None:
-        allowed_providers = {"elevenlabs", "gtts", "pyttsx3", None}
-        if v not in allowed_providers:
+        allowed = {"elevenlabs", "gtts", "pyttsx3", None}
+        if v not in allowed:
             raise ValueError(
-                f"provider must be one of {sorted(allowed_providers - {None})} or null"
+                f"provider must be one of {sorted(allowed - {None})} or null"
             )
         return v
 
 
 class GenerateVoiceResponse(BaseModel):
     """Response body for POST /generate-voice."""
-    text: str
-    emotion: str
-    confidence: float
-    raw_label: str
-    all_scores: dict[str, float]
-    voice_params: dict
-    audio_url: str
-    ssml: str
+    text:               str
+    emotion:            str
+    confidence:         float
+    raw_label:          str
+    all_scores:         dict[str, float]
+    voice_params:       dict
+    audio_url:          str
+    ssml:               str
     processing_time_ms: float
 
 
 class HealthResponse(BaseModel):
-    status: str
-    version: str
+    status:       str
+    version:      str
     tts_provider: str
+    hf_model:     str
 
 
 # ─────────────────────────────────────────────
-# API Endpoints
+# Endpoints
 # ─────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -150,20 +150,18 @@ async def serve_ui(request: Request) -> HTMLResponse:
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check() -> HealthResponse:
-    """Simple liveness probe."""
+    """Liveness probe."""
     return HealthResponse(
         status="ok",
         version=config.APP_VERSION,
         tts_provider=config.TTS_PROVIDER,
+        hf_model=config.EMOTION_MODEL_NAME,
     )
 
 
 @app.get("/emotion-map", tags=["Reference"])
 async def get_emotion_map() -> JSONResponse:
-    """
-    Return the full emotion-to-voice-parameter mapping table.
-    Useful for frontend visualisations and API consumers.
-    """
+    """Return the full emotion-to-voice-parameter mapping table."""
     return JSONResponse(content=voice_mapper.get_emotion_map())
 
 
@@ -176,18 +174,17 @@ async def get_emotion_map() -> JSONResponse:
 async def generate_voice(body: GenerateVoiceRequest) -> GenerateVoiceResponse:
     """
     Full pipeline:
-      1. Detect emotion from text (unless voice_style override supplied)
-      2. Map emotion → voice parameters (with intensity scaling)
-      3. Synthesise speech via the configured TTS provider
-      4. Return audio URL + full metadata
+      1. Detect emotion from text via HuggingFace API (unless voice_style is set)
+      2. Map emotion → voice parameters
+      3. Synthesise speech via ElevenLabs (or fallback)
+      4. Return audio URL + metadata
 
-    **voice_style** lets the caller force a specific emotion regardless of the
-    detected one – useful for demo and testing scenarios.
+    voice_style lets the caller force a specific emotion — useful for demos/testing.
     """
     t_start = time.perf_counter()
 
     try:
-        # Step 1 – Emotion Detection
+        # Step 1 — Emotion Detection
         emotion_result = emotion_detector.detect(body.text)
 
         # Apply voice_style override if provided
@@ -198,17 +195,17 @@ async def generate_voice(body: GenerateVoiceRequest) -> GenerateVoiceResponse:
             )
             emotion_result.emotion = body.voice_style
 
-        # Step 2 – Voice Mapping
+        # Step 2 — Voice Mapping
         voice_params = voice_mapper.map(emotion_result)
 
-        # Step 3 – TTS Synthesis
+        # Step 3 — TTS Synthesis
         audio_path, audio_url = tts_engine.generate(
             text=body.text,
             params=voice_params,
             preferred_provider=body.provider,
         )
 
-        # Step 4 – SSML (bonus feature)
+        # Step 4 — SSML (bonus)
         ssml = tts_engine.get_ssml(body.text, voice_params)
 
         processing_ms = (time.perf_counter() - t_start) * 1000
@@ -232,10 +229,10 @@ async def generate_voice(body: GenerateVoiceRequest) -> GenerateVoiceResponse:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
-        logger.exception("TTS generation failed")
+        logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
-        logger.exception("Unexpected error during voice generation")
+        logger.exception("Unexpected error")
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {type(exc).__name__}: {exc}",
@@ -243,7 +240,7 @@ async def generate_voice(body: GenerateVoiceRequest) -> GenerateVoiceResponse:
 
 
 # ─────────────────────────────────────────────
-# Server Entry Point
+# Entry Point
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":

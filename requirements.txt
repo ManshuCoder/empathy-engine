@@ -1,27 +1,24 @@
-# Core dependencies
+# ─────────────────────────────────────────────
+# The Empathy Engine – Python Dependencies
+# ─────────────────────────────────────────────
+
+# Web framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 pydantic>=2.6.0
 python-multipart==0.0.9
 
-# Emotion detection (HuggingFace ecosystem)
-transformers==4.41.2
-torch==2.3.0
-tokenizers>=0.19.0
-huggingface_hub>=0.23.0
-
-# ElevenLabs TTS (primary provider)
+# HTTP client (HuggingFace API + ElevenLabs API calls)
 requests>=2.31.0
 
-# gTTS fallback (Google Translate TTS – free)
+# gTTS fallback (Google Translate TTS – free, requires internet)
 gtts==2.5.1
 
 # Offline TTS fallback
 pyttsx3==2.90
 
-# Audio utilities
-pydub==0.25.1       # audio format conversion / manipulation
+# Environment variable loading
+python-dotenv==1.0.1
 
-# Utilities
-python-dotenv==1.0.1    # load .env for secrets
-aiofiles==23.2.1        # async static file handling
+# Async static file handling
+aiofiles==23.2.1

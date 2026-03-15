@@ -1,21 +1,14 @@
 """
 tts_engine.py - Text-to-Speech Engine for The Empathy Engine
 
-Provides a unified TTS interface with three PROVIDER strategies:
-  1. ElevenLabs API  (primary – highest quality, voice style control)
-  2. gTTS            (fallback – free, requires internet)
-  3. pyttsx3         (offline fallback – no internet needed)
+Primary provider:  ElevenLabs API  (high-quality, expressive)
+Fallback 1:        gTTS            (free Google TTS, internet required)
+Fallback 2:        pyttsx3         (offline, no internet)
 
-The active provider is chosen by config.TTS_PROVIDER.
-
-Voice parameters from VoiceMapper are applied to each provider as best
-the API allows:
-  • ElevenLabs supports stability, similarity_boost, style, speaking_rate
-  • gTTS supports speaking_rate (via tempo adjustment in post-processing)
-  • pyttsx3 supports rate and volume natively
+The active provider is chosen by config.TTS_PROVIDER (env var).
+Voice parameters from VoiceMapper are applied to each provider.
 """
 
-import io
 import logging
 import time
 import uuid
@@ -37,28 +30,22 @@ logger = logging.getLogger(__name__)
 
 def build_ssml(text: str, params: VoiceParameters) -> str:
     """
-    Wrap plain text in SSML prosody tags so TTS engines that support SSML
-    (like Google Cloud TTS) can interpret pitch and rate directly.
-
-    Even for engines that ignore SSML we return valid XML so developers can
-    inspect what parameters would have been applied.
+    Wrap text in SSML prosody tags for TTS engines that support it.
+    ElevenLabs does not use SSML natively, but we generate it here
+    as the assignment bonus feature so developers can inspect it.
     """
-    # Convert semitone offset to percentage for SSML prosody pitch attribute
-    # Rule of thumb: each semitone ≈ ~6% relative pitch change
-    pitch_pct = params.pitch * 6
-    pitch_str = f"{pitch_pct:+.1f}%"
+    pitch_pct  = params.pitch * 6          # 1 semitone ≈ 6% relative pitch
+    pitch_str  = f"{pitch_pct:+.1f}%"
+    rate_str   = f"{params.speaking_rate:.2f}"
+    volume_db  = f"{(params.volume - 1.0) * 6:+.1f}dB"
 
-    rate_str = f"{params.speaking_rate:.2f}"
-    volume_db = f"{(params.volume - 1.0) * 6:+.1f}dB"   # ±6 dB corresponds to ±50% amplitude
-
-    ssml = (
+    return (
         "<speak>"
         f'<prosody pitch="{pitch_str}" rate="{rate_str}" volume="{volume_db}">'
         f"{text}"
         "</prosody>"
         "</speak>"
     )
-    return ssml
 
 
 # ─────────────────────────────────────────────
@@ -76,44 +63,44 @@ class TTSProvider(ABC):
         output_path: Path,
     ) -> Path:
         """
-        Synthesise speech and write it to *output_path*.
-
-        Args:
-            text        : Raw text to convert to speech.
-            params      : Voice parameters from VoiceMapper.
-            output_path : Where to write the audio file.
+        Synthesise speech and write it to output_path.
 
         Returns:
-            The actual path of the written audio file (may differ in extension).
+            The actual path of the written audio file (extension may vary).
         """
 
 
 # ─────────────────────────────────────────────
-# Provider 1 – ElevenLabs
+# Provider 1 – ElevenLabs (Primary)
 # ─────────────────────────────────────────────
 
 class ElevenLabsProvider(TTSProvider):
     """
-    Uses the ElevenLabs v1 REST API to generate high-quality, expressive speech.
+    Uses the ElevenLabs v1 REST API.
 
-    Voice settings applied per request:
-      stability        → how variable the voice is (lower = more expressive)
-      similarity_boost → how closely it matches the trained voice
-      style            → exaggeration of the voice style
-      use_speaker_boost → additional clarity enhancement
+    Endpoint: POST /v1/text-to-speech/{voice_id}
 
-    Speaking rate is applied via the `speed` field available in the
-    text-to-speech-with-timestamps endpoint (experimental) or via SSML prosody.
+    Voice settings applied per emotion:
+      stability        → voice variability  (low = expressive)
+      similarity_boost → voice clarity
+      style            → style exaggeration
+      use_speaker_boost → additional clarity
+
+    Each emotion maps to a different voice_id for maximum expressiveness.
     """
 
     def __init__(self) -> None:
         self.api_key = config.ELEVENLABS_API_KEY
-        self.base_url = config.ELEVENLABS_API_URL
-        self.model_id = config.ELEVENLABS_MODEL
+        if not self.api_key:
+            raise RuntimeError(
+                "ELEVENLABS_API_KEY is not set. "
+                "Add it to your .env file or set the environment variable."
+            )
         self._session = requests.Session()
         self._session.headers.update({
-            "xi-api-key": self.api_key,
-            "Content-Type": "application/json",
+            "xi-api-key":     self.api_key,
+            "Content-Type":   "application/json",
+            "Accept":         "audio/mpeg",
         })
         logger.info("ElevenLabsProvider initialised.")
 
@@ -130,48 +117,54 @@ class ElevenLabsProvider(TTSProvider):
         output_path: Path,
     ) -> Path:
         voice_id = self._get_voice_id(params.emotion)
-        url = f"{self.base_url}/text-to-speech/{voice_id}"
+        url      = f"{config.ELEVENLABS_API_URL}/text-to-speech/{voice_id}"
 
         payload = {
-            "text": text,
-            "model_id": self.model_id,
+            "text":     text,
+            "model_id": config.ELEVENLABS_MODEL,
             "voice_settings": {
-                "stability": round(params.stability, 3),
+                "stability":        round(params.stability, 3),
                 "similarity_boost": round(params.similarity_boost, 3),
-                "style": round(params.style, 3),
+                "style":            round(params.style, 3),
                 "use_speaker_boost": True,
             },
         }
 
         logger.info(
-            f"ElevenLabs → voice_id={voice_id}, "
+            f"ElevenLabs → voice_id={voice_id}, emotion={params.emotion}, "
             f"stability={params.stability:.2f}, style={params.style:.2f}"
         )
 
         resp = self._session.post(url, json=payload, timeout=30)
 
-        if resp.status_code != 200:
-            logger.error(
-                f"ElevenLabs API error {resp.status_code}: {resp.text[:300]}"
+        if resp.status_code == 401:
+            raise RuntimeError(
+                "ElevenLabs API returned 401 Unauthorized. "
+                "Check that ELEVENLABS_API_KEY is correct."
             )
+        if resp.status_code == 422:
+            raise RuntimeError(
+                f"ElevenLabs API returned 422 Unprocessable Entity: {resp.text[:300]}"
+            )
+        if not resp.ok:
+            logger.error(f"ElevenLabs error {resp.status_code}: {resp.text[:300]}")
             resp.raise_for_status()
 
-        # API returns raw MP3 bytes
+        # Response body is raw MP3 bytes
         mp3_path = output_path.with_suffix(".mp3")
         mp3_path.write_bytes(resp.content)
-        logger.info(f"Audio saved to {mp3_path} ({len(resp.content):,} bytes)")
+        logger.info(f"ElevenLabs audio saved: {mp3_path} ({len(resp.content):,} bytes)")
         return mp3_path
 
 
 # ─────────────────────────────────────────────
-# Provider 2 – gTTS (Google Text-to-Speech, free)
+# Provider 2 – gTTS (Free fallback)
 # ─────────────────────────────────────────────
 
 class GTTSProvider(TTSProvider):
     """
-    Uses the public gTTS library (Google Translate TTS endpoint).
-    Limited voice customisation – we control speaking speed (slow flag only).
-    Post-processing with pydub can be added for pitch shifting.
+    Uses the gTTS library (Google Translate TTS).
+    Limited customisation — speaking rate via the slow flag only.
     """
 
     def synthesise(
@@ -183,28 +176,24 @@ class GTTSProvider(TTSProvider):
         try:
             from gtts import gTTS  # type: ignore
         except ImportError:
-            raise RuntimeError(
-                "gTTS is not installed. Run: pip install gtts"
-            ) from None
+            raise RuntimeError("gTTS is not installed. Run: pip install gtts") from None
 
-        slow = params.speaking_rate < 0.85   # gTTS only has a boolean slow flag
-        tts = gTTS(text=text, lang="en", slow=slow)
-
+        slow    = params.speaking_rate < 0.85
+        tts     = gTTS(text=text, lang="en", slow=slow)
         mp3_path = output_path.with_suffix(".mp3")
         tts.save(str(mp3_path))
-        logger.info(f"gTTS audio saved to {mp3_path}")
+        logger.info(f"gTTS audio saved: {mp3_path}")
         return mp3_path
 
 
 # ─────────────────────────────────────────────
-# Provider 3 – pyttsx3 (offline)
+# Provider 3 – pyttsx3 (Offline fallback)
 # ─────────────────────────────────────────────
 
 class Pyttsx3Provider(TTSProvider):
     """
     Offline TTS using pyttsx3 (wraps eSpeak / SAPI / nsss depending on OS).
-    Supports rate and volume natively; pitch is system-dependent.
-    Output is WAV on most platforms.
+    Supports rate and volume natively. Output is WAV.
     """
 
     def synthesise(
@@ -216,22 +205,17 @@ class Pyttsx3Provider(TTSProvider):
         try:
             import pyttsx3  # type: ignore
         except ImportError:
-            raise RuntimeError(
-                "pyttsx3 is not installed. Run: pip install pyttsx3"
-            ) from None
+            raise RuntimeError("pyttsx3 is not installed. Run: pip install pyttsx3") from None
 
         engine = pyttsx3.init()
-
-        # Default WPM ≈ 200; scale by speaking_rate
-        base_wpm = 200
-        engine.setProperty("rate", int(base_wpm * params.speaking_rate))
+        engine.setProperty("rate",   int(200 * params.speaking_rate))
         engine.setProperty("volume", params.volume)
 
         wav_path = output_path.with_suffix(".wav")
         engine.save_to_file(text, str(wav_path))
         engine.runAndWait()
         engine.stop()
-        logger.info(f"pyttsx3 audio saved to {wav_path}")
+        logger.info(f"pyttsx3 audio saved: {wav_path}")
         return wav_path
 
 
@@ -243,12 +227,11 @@ class TTSEngine:
     """
     High-level facade that:
       1. Selects the configured TTS provider.
-      2. Generates a unique filename for each request.
-      3. Delegates synthesis to the provider.
+      2. Generates a unique filename for each audio file.
+      3. Delegates synthesis to the provider with automatic fallback.
       4. Returns the relative URL path for the API response.
 
-    Falls back through ElevenLabs → gTTS → pyttsx3 if the preferred
-    provider raises an exception.
+    Fallback chain: ElevenLabs → gTTS → pyttsx3
     """
 
     PROVIDERS: dict[str, type[TTSProvider]] = {
@@ -262,7 +245,7 @@ class TTSEngine:
     def __init__(self, provider: str = config.TTS_PROVIDER) -> None:
         self.provider_name = provider
         self._providers: dict[str, TTSProvider] = {}
-        logger.info(f"TTSEngine initialised with provider='{provider}'")
+        logger.info(f"TTSEngine initialised → primary provider='{provider}'")
 
     def _get_provider(self, name: str) -> TTSProvider:
         if name not in self._providers:
@@ -273,9 +256,9 @@ class TTSEngine:
         return self._providers[name]
 
     def _unique_path(self) -> Path:
-        """Generate a unique output file stem inside the audio directory."""
+        """Generate a unique output file path inside the audio directory."""
         stem = f"audio_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        return config.AUDIO_DIR / stem   # extension added by provider
+        return config.AUDIO_DIR / stem   # provider appends the extension
 
     def generate(
         self,
@@ -284,20 +267,20 @@ class TTSEngine:
         preferred_provider: Optional[str] = None,
     ) -> tuple[Path, str]:
         """
-        Synthesise speech for *text* using *params*.
+        Synthesise speech for text using params.
 
         Args:
             text               : Input text.
             params             : VoiceParameters from the mapper.
-            preferred_provider : Override the default provider for this call.
+            preferred_provider : Override the default provider for this request.
 
         Returns:
-            (audio_file_path, relative_url_path)
+            (audio_file_path, relative_url_for_api_response)
         """
-        output_base = self._unique_path()
+        output_base   = self._unique_path()
         provider_name = preferred_provider or self.provider_name
 
-        # Build fallback chain: preferred first, then the rest in order
+        # Build fallback chain: preferred provider first, then the rest
         chain = [provider_name] + [
             p for p in self.FALLBACK_ORDER if p != provider_name
         ]
@@ -305,10 +288,9 @@ class TTSEngine:
         last_exc: Optional[Exception] = None
         for name in chain:
             try:
-                provider = self._get_provider(name)
+                provider   = self._get_provider(name)
                 audio_path = provider.synthesise(text, params, output_base)
-                # Build the relative URL served by FastAPI's StaticFiles mount
-                rel_url = f"/static/generated_audio/{audio_path.name}"
+                rel_url    = f"/static/generated_audio/{audio_path.name}"
                 logger.info(f"TTS success via '{name}': {rel_url}")
                 return audio_path, rel_url
             except Exception as exc:
@@ -320,7 +302,7 @@ class TTSEngine:
         ) from last_exc
 
     def get_ssml(self, text: str, params: VoiceParameters) -> str:
-        """Return the SSML representation for the given text and params (bonus feature)."""
+        """Return SSML for the given text and voice params (bonus feature)."""
         return build_ssml(text, params)
 
 

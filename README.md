@@ -1,94 +1,58 @@
-# The Empathy Engine 🎙️
-### *Giving AI a Human Voice*
+# 🎙️ The Empathy Engine
+### Challenge 1 — Giving AI a Human Voice
 
-> **Convert text into emotionally expressive speech** by detecting emotional tone and dynamically adjusting pitch, speaking rate, volume, and voice character before synthesis.
-
----
-
-## 🌟 Project Overview
-
-The Empathy Engine bridges the gap between flat, robotic TTS output and truly expressive, human-like speech. Instead of treating all text the same, the system:
-
-1. **Detects emotion** in the input text using a fine-tuned DistilBERT model
-2. **Maps the emotion** to specific voice parameters (pitch, rate, volume, tone)
-3. **Synthesises speech** via ElevenLabs with emotion-appropriate voice settings
-4. **Serves the audio** through a clean REST API and browser-based UI
+> An AI service that converts text into **emotionally expressive speech** by detecting the emotional tone of input text using HuggingFace and synthesising natural-sounding audio via ElevenLabs.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     POST /generate-voice                        │
-│                        (app.py)                                 │
-└─────────────────┬───────────────────────────────────────────────┘
-                  │  text
-                  ▼
-┌─────────────────────────────────┐
-│      Emotion Detector           │
-│   (emotion_detector.py)         │
-│                                 │
-│  DistilBERT fine-tuned on       │
-│  the 'emotion' dataset          │
-│  → raw label + confidence       │
-│  → canonical emotion label      │
-└─────────────────┬───────────────┘
-                  │  EmotionResult
-                  ▼
-┌─────────────────────────────────┐
-│       Voice Mapper              │
-│    (voice_mapper.py)            │
-│                                 │
-│  emotion + confidence           │
-│  → intensity-scaled params      │
-│  → pitch, rate, volume,         │
-│    stability, style             │
-└─────────────────┬───────────────┘
-                  │  VoiceParameters
-                  ▼
-┌─────────────────────────────────┐
-│        TTS Engine               │
-│      (tts_engine.py)            │
-│                                 │
-│  Provider cascade:              │
-│  1. ElevenLabs API  (primary)   │
-│  2. gTTS            (fallback)  │
-│  3. pyttsx3         (offline)   │
-│                                 │
-│  + SSML generation              │
-└─────────────────┬───────────────┘
-                  │  audio file (.mp3/.wav)
-                  ▼
-         /static/generated_audio/
-              audio_<id>.mp3
+User Text Input
+      │
+      ▼
+┌─────────────────────────────────────┐
+│  POST /generate-voice  (FastAPI)    │
+└─────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────┐
+│  emotion_detector.py                │
+│  HuggingFace Inference API          │
+│  Model: j-hartmann/emotion-english- │
+│         distilroberta-base          │
+│  → anger | disgust | fear | joy     │
+│    neutral | sadness | surprise     │
+│  → normalised to 5 canonical labels │
+└─────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────┐
+│  voice_mapper.py                    │
+│  Emotion → Voice Parameters         │
+│  Intensity scaling via confidence   │
+│  ─────────────────────────────────  │
+│  happy    → pitch ↑, rate ↑, lively │
+│  sad      → pitch ↓, rate ↓, soft  │
+│  angry    → pitch ↑, loud, sharp   │
+│  concerned→ rate ↓, gentle tone    │
+│  neutral  → default voice          │
+└─────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────┐
+│  tts_engine.py                      │
+│  ElevenLabs API                     │
+│  POST /v1/text-to-speech/{voice_id} │
+│  Parameters: stability,             │
+│  similarity_boost, style            │
+│  Fallback: gTTS → pyttsx3          │
+└─────────────────────────────────────┘
+      │
+      ▼
+    🔊 Audio File (MP3)
+    ← Served via /static/generated_audio/
 ```
-
----
-
-## ⚡ Emotion → Voice Parameter Mapping
-
-The core insight is that different emotions require different *acoustic characteristics* to sound authentic:
-
-| Emotion   | Pitch       | Rate        | Volume      | Tone        | ElevenLabs Stability | Notes                          |
-|-----------|-------------|-------------|-------------|-------------|----------------------|--------------------------------|
-| 😊 Happy  | +3 semitones| 1.25×       | 1.1×        | Cheerful    | Low (0.30)           | Fast, bright, expressive       |
-| 😢 Sad    | −2.5 st     | 0.80×       | 0.85×       | Melancholic | High (0.70)          | Slow, flat, hushed             |
-| 😠 Angry  | +4 st       | 1.15×       | 1.25×       | Sharp       | Very low (0.20)      | Loud, tense, variable          |
-| 😟 Concerned | −1 st  | 0.90×       | 0.92×       | Worried     | Medium (0.55)        | Careful, measured, soft        |
-| 😐 Neutral | 0 st       | 1.00×       | 1.00×       | Neutral     | 0.50                 | Balanced, clear, professional  |
-
-### 🔀 Intensity Scaling (Bonus Feature)
-
-Parameters are not simply switched on/off — they are **blended** based on the model's confidence score:
-
-```
-param = neutral_value + confidence × (target_value − neutral_value)
-```
-
-- **Low confidence (40%)** → subtle emotional colouring
-- **High confidence (90%)** → fully committed to the emotion
-- **Capped at 95%** to retain naturalness even at maximum confidence
 
 ---
 
@@ -96,241 +60,208 @@ param = neutral_value + confidence × (target_value − neutral_value)
 
 ```
 empathy-engine/
-│
-├── app.py                    ← FastAPI server & API endpoints
-├── emotion_detector.py       ← HuggingFace DistilBERT wrapper
-├── voice_mapper.py           ← Emotion → voice parameter mapping
-├── tts_engine.py             ← Multi-provider TTS (ElevenLabs/gTTS/pyttsx3)
-├── config.py                 ← All configuration, keys, constants
-├── requirements.txt          ← Python dependencies
+├── app.py                   # FastAPI server + API endpoints
+├── emotion_detector.py      # HuggingFace Inference API client
+├── voice_mapper.py          # Emotion → voice parameter mapping
+├── tts_engine.py            # ElevenLabs / gTTS / pyttsx3 providers
+├── config.py                # All configuration, API keys, constants
 │
 ├── static/
-│   ├── index.html            ← Web UI (HTML+CSS+JS, no framework)
-│   └── generated_audio/      ← Generated .mp3 / .wav files (auto-created)
+│   ├── index.html           # Web UI (HTML + CSS + Vanilla JS)
+│   └── generated_audio/     # Generated MP3 files
 │
-└── README.md                 ← This file
+├── .env                     # API keys (git-ignored)
+├── .env.example             # Template — copy to .env
+├── .gitignore
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## 🛠️ Setup Instructions
+## 🔌 APIs Used
 
-### Prerequisites
-- Python 3.10+
-- ~4 GB free disk space (for the DistilBERT model weights on first run)
-- Internet connection (for ElevenLabs API and model download)
+### 1. HuggingFace Inference API — Emotion Detection
 
-### 1. Clone / Navigate to the project
+- **Model**: [`j-hartmann/emotion-english-distilroberta-base`](https://huggingface.co/j-hartmann/emotion-english-distilroberta-base)
+- **Endpoint**: `POST https://api-inference.huggingface.co/models/j-hartmann/emotion-english-distilroberta-base`
+- **Output**: 7 probability scores — `anger`, `disgust`, `fear`, `joy`, `neutral`, `sadness`, `surprise`
+- **Normalised to**: 5 canonical labels — `happy`, `sad`, `angry`, `concerned`, `neutral`
 
+```python
+# Example request
+headers = {"Authorization": "Bearer <HF_API_KEY>"}
+payload = {
+    "inputs": "I can't believe this happened. I'm devastated.",
+    "parameters": {"return_all_scores": True},
+    "options": {"wait_for_model": True}
+}
+response = requests.post(HF_INFERENCE_URL, headers=headers, json=payload)
+# → [{"label": "sadness", "score": 0.87}, ...]
+```
+
+### 2. ElevenLabs API — Voice Synthesis
+
+- **Endpoint**: `POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`
+- **Model**: `eleven_multilingual_v2`
+- **Parameters**: `stability`, `similarity_boost`, `style`, `use_speaker_boost`
+- **Voice per emotion**: Different voice IDs mapped to each emotion for maximum expressiveness
+
+```python
+# Example request
+headers = {"xi-api-key": "<ELEVENLABS_KEY>", "Content-Type": "application/json"}
+payload = {
+    "text": "I'm so happy today!",
+    "model_id": "eleven_multilingual_v2",
+    "voice_settings": {
+        "stability": 0.30,
+        "similarity_boost": 0.75,
+        "style": 0.40,
+        "use_speaker_boost": True
+    }
+}
+# Response: raw MP3 bytes
+```
+
+---
+
+## 🎭 Emotion → Voice Mapping
+
+| Emotion   | Pitch     | Rate      | Stability | Style | Description                        |
+|-----------|-----------|-----------|-----------|-------|------------------------------------|
+| happy     | +3.0 st   | 1.25×     | 0.30      | 0.40  | Bright, energetic, upbeat          |
+| sad       | −2.5 st   | 0.80×     | 0.70      | 0.10  | Low, slow, melancholic             |
+| angry     | +4.0 st   | 1.15×     | 0.20      | 0.60  | Sharp, assertive, high intensity   |
+| concerned | −1.0 st   | 0.90×     | 0.55      | 0.20  | Gentle, careful, measured          |
+| neutral   | ±0 st     | 1.00×     | 0.50      | 0.00  | Professional, clear, flat          |
+
+**Intensity Scaling**: Voice parameters are blended between neutral and target values proportional to the confidence score:
+```
+param = neutral + confidence × (target − neutral)
+```
+
+---
+
+## 🚀 Setup & Running
+
+### 1. Clone & enter directory
 ```bash
+git clone https://github.com/ManshuCoder/empathy-engine.git
 cd empathy-engine
 ```
 
-### 2. Create a virtual environment
-
+### 2. Create virtual environment
 ```bash
 python -m venv .venv
-
-# Windows
+# Windows:
 .venv\Scripts\activate
-
-# macOS / Linux
+# macOS/Linux:
 source .venv/bin/activate
 ```
 
 ### 3. Install dependencies
-
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Note**: `torch` is a large package (~2 GB). If you only need CPU inference
-> (no GPU), the standard PyTorch wheel works fine.
-
-### 4. Configure API keys (optional — defaults are pre-set in config.py)
-
-Create a `.env` file in the project root:
-
-```env
-ELEVENLABS_API_KEY=sk_your_key_here
-HUGGINGFACE_API_KEY=hf_your_key_here
-TTS_PROVIDER=elevenlabs        # elevenlabs | gtts | pyttsx3
+### 4. Configure API keys
+```bash
+cp .env.example .env
+# Edit .env and fill in your keys:
+# HUGGINGFACE_API_KEY=hf_...
+# ELEVENLABS_API_KEY=...
+# TTS_PROVIDER=elevenlabs
 ```
 
 ### 5. Run the server
-
 ```bash
 python app.py
 ```
 
-Or with Uvicorn directly:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The server starts at **http://localhost:8000**.
+Open **http://localhost:8001** in your browser.
 
 ---
 
-## 🌐 Using the Web Interface
-
-Open **http://localhost:8000** in your browser.
-
-1. Type or paste any text into the input box (or click a sample chip)
-2. Optionally select a **Voice Override** to force a specific emotion
-3. Optionally select a **TTS Engine** (default: ElevenLabs)
-4. Click **Generate Voice** (or press `Ctrl+Enter`)
-5. The UI shows:
-   - Detected emotion + confidence
-   - Emotion distribution bar chart
-   - Voice parameters used
-   - Audio player with download link
-   - Generated SSML markup
-
----
-
-## 📡 API Reference
+## 🌐 API Reference
 
 ### `POST /generate-voice`
-
 Convert text to emotionally expressive speech.
 
-**Request Body:**
-
+**Request:**
 ```json
 {
-  "text": "I can't believe this happened. It's absolutely devastating.",
+  "text": "I can't believe this happened. I'm really upset.",
   "voice_style": null,
   "provider": null
 }
 ```
-
-| Field         | Type   | Required | Description                                          |
-|---------------|--------|----------|------------------------------------------------------|
-| `text`        | string | ✅       | Text to synthesise (1–5000 characters)               |
-| `voice_style` | string | ❌       | Force emotion: `happy`\|`sad`\|`angry`\|`concerned`\|`neutral` |
-| `provider`    | string | ❌       | TTS engine: `elevenlabs`\|`gtts`\|`pyttsx3`          |
+- `voice_style` (optional): Force an emotion — `happy | sad | angry | concerned | neutral`
+- `provider` (optional): Override TTS engine — `elevenlabs | gtts | pyttsx3`
 
 **Response:**
-
 ```json
 {
-  "text": "I can't believe this happened. It's absolutely devastating.",
+  "text": "I can't believe this happened...",
   "emotion": "sad",
-  "confidence": 0.9123,
+  "confidence": 0.8734,
   "raw_label": "sadness",
-  "all_scores": {
-    "sad": 0.9123,
-    "angry": 0.0412,
-    "neutral": 0.0231,
-    "concerned": 0.0178,
-    "happy": 0.0056
-  },
-  "voice_params": {
-    "emotion": "sad",
-    "pitch": -2.317,
-    "speaking_rate": 0.818,
-    "volume": 0.886,
-    "tone": "melancholic",
-    "stability": 0.682,
-    "similarity_boost": 0.704,
-    "style": 0.091,
-    "confidence": 0.9123,
-    "description": "Lower pitch, slower rate, softer volume – conveys sorrow and grief."
-  },
-  "audio_url": "/static/generated_audio/audio_1710234567_a1b2c3d4.mp3",
-  "ssml": "<speak><prosody pitch=\"-13.9%\" rate=\"0.82\" volume=\"-0.7dB\">I can't believe...</prosody></speak>",
-  "processing_time_ms": 1243.6
+  "all_scores": { "sad": 0.87, "neutral": 0.08, ... },
+  "voice_params": { "pitch": -2.37, "speaking_rate": 0.81, "stability": 0.68, ... },
+  "audio_url": "/static/generated_audio/audio_1234567890_abcd1234.mp3",
+  "ssml": "<speak><prosody pitch='-14.2%' rate='0.81'>...</prosody></speak>",
+  "processing_time_ms": 1240.5
 }
 ```
 
-### `GET /emotion-map`
-
-Returns the full emotion → voice parameter mapping table.
-
 ### `GET /health`
-
-Liveness probe. Returns `{"status": "ok", "version": "1.0.0", "tts_provider": "elevenlabs"}`.
-
-### Interactive API Docs
-
-- Swagger UI: **http://localhost:8000/docs**
-- ReDoc:       **http://localhost:8000/redoc**
-
----
-
-## 🧪 Example API Requests
-
-Using `curl`:
-
-```bash
-# Happy sentence
-curl -X POST http://localhost:8000/generate-voice \
-  -H "Content-Type: application/json" \
-  -d '{"text": "I just got promoted! This is the best day of my life!"}'
-
-# Force sad emotion
-curl -X POST http://localhost:8000/generate-voice \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Everything feels grey today.", "voice_style": "sad"}'
-
-# Use gTTS as the engine
-curl -X POST http://localhost:8000/generate-voice \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Are you okay? I am worried about you.", "provider": "gtts"}'
+```json
+{ "status": "ok", "version": "2.0.0", "tts_provider": "elevenlabs", "hf_model": "j-hartmann/..." }
 ```
 
-Using Python:
+### `GET /emotion-map`
+Returns the full emotion → voice parameter reference table.
 
-```python
-import requests
-
-resp = requests.post(
-    "http://localhost:8000/generate-voice",
-    json={"text": "This is absolutely unacceptable! I demand an explanation!"}
-)
-data = resp.json()
-print(f"Emotion : {data['emotion']} ({data['confidence']:.0%})")
-print(f"Audio   : http://localhost:8000{data['audio_url']}")
-```
+### `GET /docs`
+Interactive Swagger UI for all endpoints.
 
 ---
 
-## 🎁 Bonus Features Implemented
+## ✨ Bonus Features Implemented
 
-| Feature                     | Location               | Description                                          |
-|-----------------------------|------------------------|------------------------------------------------------|
-| Emotion confidence scores   | API response           | Full probability distribution over all emotions      |
-| Intensity scaling           | `voice_mapper.py`      | Params blended with confidence for natural gradation |
-| SSML generation             | `tts_engine.py`        | Full SSML prosody markup in every response           |
-| Emotion distribution chart  | Web UI                 | Bar chart of all emotion probabilities               |
-| Voice style override        | API + UI               | Force a specific emotion regardless of detection     |
-| TTS provider selection      | API + UI               | Switch engines per request                           |
-| Provider fallback cascade   | `tts_engine.py`        | Auto-retry with next provider on failure             |
-| Offline TTS (pyttsx3)       | `tts_engine.py`        | Works without internet or API key                    |
-
----
-
-## ⚙️ Configuration Reference (`config.py`)
-
-| Key                     | Default                              | Description                   |
-|-------------------------|--------------------------------------|-------------------------------|
-| `ELEVENLABS_API_KEY`    | (pre-set)                            | ElevenLabs API key            |
-| `HUGGINGFACE_API_KEY`   | (pre-set)                            | HuggingFace API key           |
-| `TTS_PROVIDER`          | `"elevenlabs"`                       | Active TTS engine             |
-| `EMOTION_MODEL_NAME`    | `"bhadresh-savani/distilbert-base-uncased-emotion"` | HF model |
-| `AUDIO_FORMAT`          | `"mp3"`                              | Output format                 |
-| `PORT`                  | `8000`                               | Server port                   |
+- ✅ **Emotion confidence score** displayed with animated progress bar
+- ✅ **Emotion distribution chart** — bar chart for all 5 canonical emotions
+- ✅ **Emotion highlight UI** — glowing active-state buttons
+- ✅ **SSML output** — full Speech Synthesis Markup Language display
+- ✅ **Voice style control** — per-emotion stability, style, similarity_boost
+- ✅ **Waveform visualisation** — animated audio waveform bars
+- ✅ **Automatic fallback** — ElevenLabs → gTTS → pyttsx3
+- ✅ **TTS provider selector** — switch live between providers
+- ✅ **Keyboard shortcut** — Ctrl+Enter to generate
+- ✅ **Audio download** — built-in download button
 
 ---
 
-## 🔒 Security Note
+## 🔒 Security
 
-API keys in `config.py` are provided for convenience during evaluation. In production, always load secrets from environment variables or a secrets manager — never hard-code them in source files.
+- All API keys are loaded via environment variables — never hardcoded
+- `.env` is listed in `.gitignore` and never committed
+- Keys default to empty string if not set — app degrades gracefully
 
 ---
 
-## 📄 License
+## 📦 Dependencies
 
-MIT — free to use, modify, and distribute.
+| Package | Purpose |
+|---------|---------|
+| `fastapi` | Web framework |
+| `uvicorn` | ASGI server |
+| `requests` | HuggingFace + ElevenLabs HTTP calls |
+| `python-dotenv` | .env loading |
+| `gtts` | Free Google TTS fallback |
+| `pyttsx3` | Offline TTS fallback |
+| `pydantic` | Request/response validation |
+| `aiofiles` | Async static file serving |
+
+---
+
+*The Empathy Engine — Challenge 1 Submission*
