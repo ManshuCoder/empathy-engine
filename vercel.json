@@ -1,19 +1,29 @@
 {
   "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/static/(.*)",
-      "dest": "/static/$1"
+      "source": "/generate-voice",
+      "destination": "https://empathy-engine-u2jo.onrender.com/generate-voice"
     },
     {
-      "src": "/(.*)",
-      "dest": "api/index.py"
+      "source": "/health",
+      "destination": "https://empathy-engine-u2jo.onrender.com/health"
+    },
+    {
+      "source": "/emotion-map",
+      "destination": "https://empathy-engine-u2jo.onrender.com/emotion-map"
+    },
+    {
+      "source": "/static/generated_audio/(.*)",
+      "destination": "https://empathy-engine-u2jo.onrender.com/static/generated_audio/$1"
+    },
+    {
+      "source": "/static/(.*)",
+      "destination": "/static/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/static/index.html"
     }
   ]
 }
