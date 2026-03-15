@@ -1,12 +1,16 @@
-# ─────────────────────────────────────────────
-# The Empathy Engine – Python Dependencies
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# The Empathy Engine – Python Dependencies (Vercel-compatible)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Web framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 pydantic>=2.6.0
 python-multipart==0.0.9
+
+# ASGI adapter for AWS Lambda / Vercel serverless
+# Wraps the FastAPI app so Vercel's Python runtime can invoke it
+mangum==0.17.0
 
 # HTTP client (HuggingFace API + ElevenLabs API calls)
 requests>=2.31.0
@@ -17,8 +21,10 @@ huggingface_hub>=0.23.0
 # gTTS fallback (Google Translate TTS – free, requires internet)
 gtts==2.5.1
 
-# Offline TTS fallback
-pyttsx3==2.90
+# NOTE: pyttsx3 is intentionally EXCLUDED.
+# It requires OS-level audio drivers (eSpeak on Linux, SAPI on Windows, nsss on macOS)
+# which are NOT available in Vercel's serverless container environment.
+# Use elevenlabs (primary) or gtts (fallback) instead.
 
 # Environment variable loading
 python-dotenv==1.0.1

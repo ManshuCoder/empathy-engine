@@ -19,8 +19,10 @@ BASE_DIR   = Path(__file__).parent.resolve()
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR  = STATIC_DIR / "generated_audio"
 
-# Ensure audio output folder exists at startup
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+# NOTE: AUDIO_DIR creation is intentionally NOT done here.
+# On Vercel, the filesystem is read-only — mkdir() at import time crashes the
+# serverless function. api/index.py overrides AUDIO_DIR → /tmp/generated_audio
+# and creates it safely at request time.
 
 # ─────────────────────────────────────────────
 # API Keys  (always from environment variables)
