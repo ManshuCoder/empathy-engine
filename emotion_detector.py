@@ -1,8 +1,12 @@
 """
-emotion_detector.py - Emotion Detection via HuggingFace Inference API
+emotion_detector.py - Emotion Detection via HuggingFace InferenceClient
 
-Sends text to the HuggingFace hosted Inference API using the model:
+Sends text to the HuggingFace Inference API using the model:
     j-hartmann/emotion-english-distilroberta-base
+
+NOTE: The old api-inference.huggingface.co endpoint returned 410 Gone (deprecated).
+      This module now uses huggingface_hub.InferenceClient, which routes through
+      https://router.huggingface.co/hf-inference — the current supported endpoint.
 
 This model classifies text into 7 emotions:
     anger | disgust | fear | joy | neutral | sadness | surprise
@@ -17,8 +21,6 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-
-import requests
 
 import config
 
@@ -63,30 +65,53 @@ class EmotionDetector:
     Calls the HuggingFace Inference API to classify text emotions.
 
     Uses model: j-hartmann/emotion-english-distilroberta-base
-    Endpoint:   https://api-inference.huggingface.co/models/<model>
+
+    Migration note:
+        The legacy api-inference.huggingface.co endpoint now returns 410 Gone.
+        We now use huggingface_hub.InferenceClient, which targets:
+            https://router.huggingface.co/hf-inference
+        This is the officially supported endpoint as of 2025.
 
     The API key is read from config.HUGGINGFACE_API_KEY (env var).
-    If no key is set, HF allows a limited number of free calls per hour.
+    A valid HuggingFace token with 'Inference' permissions is required.
     """
 
     def __init__(self) -> None:
-        self._session = requests.Session()
-        self._session.headers.update({
-            "Content-Type": "application/json",
-        })
-        # Attach the API key only if available
-        if config.HUGGINGFACE_API_KEY:
-            self._session.headers["Authorization"] = (
-                f"Bearer {config.HUGGINGFACE_API_KEY}"
-            )
-            logger.info("HuggingFace API key loaded.")
-        else:
-            logger.warning(
-                "HUGGINGFACE_API_KEY not set — using unauthenticated access "
-                "(rate-limited). Set the key in your .env file for production use."
-            )
+        self._client = self._build_client()
         logger.info(
-            f"EmotionDetector ready. Model: {config.EMOTION_MODEL_NAME}"
+            f"EmotionDetector ready. Model: {config.EMOTION_MODEL_NAME} "
+            f"(using huggingface_hub.InferenceClient)"
+        )
+
+    def _build_client(self):
+        """
+        Build the InferenceClient.
+        Requires huggingface_hub >= 0.23.0
+        """
+        try:
+            from huggingface_hub import InferenceClient
+        except ImportError:
+            raise RuntimeError(
+                "huggingface_hub is not installed. "
+                "Run: pip install huggingface_hub>=0.23.0"
+            )
+
+        token = config.HUGGINGFACE_API_KEY or None
+        if not token:
+            logger.warning(
+                "HUGGINGFACE_API_KEY not set. "
+                "The HuggingFace Inference API now requires a valid token. "
+                "Set HUGGINGFACE_API_KEY in your .env file. "
+                "Get a free token at: https://huggingface.co/settings/tokens"
+            )
+        else:
+            logger.info("HuggingFace API key loaded.")
+
+        # provider="hf-inference" routes to router.huggingface.co/hf-inference
+        return InferenceClient(
+            model=config.EMOTION_MODEL_NAME,
+            token=token,
+            provider="hf-inference",
         )
 
     # ------------------------------------------------------------------
@@ -113,52 +138,50 @@ class EmotionDetector:
 
     def _call_hf_api(self, text: str) -> list[dict]:
         """
-        POST to the HuggingFace Inference API and return the list of
-        {label, score} dicts sorted by score descending.
+        Call HuggingFace InferenceClient for text classification.
 
-        Handles the model loading wait (503 → retry once after warm-up).
+        Returns a list of {label, score} dicts sorted by score descending.
+        Handles transient errors with exponential back-off (up to 3 attempts).
         """
-        payload = {
-            "inputs": text,
-            "parameters": {"return_all_scores": True},
-            "options":    {"wait_for_model": True},
-        }
+        last_exc: Optional[Exception] = None
 
         for attempt in range(3):
             try:
-                resp = self._session.post(
-                    config.HF_INFERENCE_URL,
-                    json=payload,
-                    timeout=30,
-                )
+                # InferenceClient.text_classification returns a list of
+                # ClassificationOutput objects with .label and .score attributes.
+                results = self._client.text_classification(text)
 
-                # Model is still loading — wait and retry
-                if resp.status_code == 503:
-                    estimated_wait = resp.json().get("estimated_time", 20)
-                    wait_sec = min(float(estimated_wait), 30)
-                    logger.info(
-                        f"HF model loading, waiting {wait_sec:.0f}s … "
-                        f"(attempt {attempt + 1}/3)"
-                    )
-                    time.sleep(wait_sec)
-                    continue
+                # Normalise to list of dicts for consistent downstream handling
+                scores: list[dict] = [
+                    {"label": r.label, "score": r.score}
+                    for r in results
+                ]
 
-                resp.raise_for_status()
-
-                # HF returns: [[{label, score}, …]] (list-of-lists)
-                raw: list = resp.json()
-                scores: list[dict] = raw[0] if isinstance(raw[0], list) else raw
+                # Sort by score descending
                 return sorted(scores, key=lambda x: x["score"], reverse=True)
 
-            except requests.RequestException as exc:
-                logger.error(f"HuggingFace API request failed (attempt {attempt + 1}): {exc}")
-                if attempt == 2:
-                    raise RuntimeError(
-                        f"HuggingFace Inference API call failed after 3 attempts: {exc}"
-                    ) from exc
-                time.sleep(2 ** attempt)   # exponential back-off
+            except Exception as exc:
+                err_str = str(exc)
+                logger.error(
+                    f"HuggingFace API request failed (attempt {attempt + 1}/3): {exc}"
+                )
 
-        raise RuntimeError("HuggingFace API did not respond after retries.")
+                # If model is loading, wait and retry
+                if "loading" in err_str.lower() or "503" in err_str:
+                    wait_sec = min(20 * (attempt + 1), 60)
+                    logger.info(f"Model loading, waiting {wait_sec}s…")
+                    time.sleep(wait_sec)
+                    last_exc = exc
+                    continue
+
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # exponential back-off: 1s, 2s
+                    continue
+
+        raise RuntimeError(
+            f"HuggingFace Inference API call failed after 3 attempts: {last_exc}"
+        ) from last_exc
 
     # ------------------------------------------------------------------
     # Public API

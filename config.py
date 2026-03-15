@@ -35,9 +35,14 @@ HUGGINGFACE_API_KEY: str = os.getenv("HUGGINGFACE_API_KEY", "")
 # Labels: anger | disgust | fear | joy | neutral | sadness | surprise
 EMOTION_MODEL_NAME: str = "j-hartmann/emotion-english-distilroberta-base"
 
-# HuggingFace Inference API endpoint
+# HuggingFace Inference provider (via huggingface_hub.InferenceClient)
+# The old api-inference.huggingface.co endpoint was deprecated (410 Gone).
+# The new endpoint is router.huggingface.co via provider="hf-inference".
+HF_PROVIDER: str = "hf-inference"
+
+# Kept for reference / legacy docs — NOT used for API calls any more
 HF_INFERENCE_URL: str = (
-    f"https://api-inference.huggingface.co/models/{EMOTION_MODEL_NAME}"
+    f"https://router.huggingface.co/hf-inference/models/{EMOTION_MODEL_NAME}"
 )
 
 # Map raw HF labels → the 5 canonical emotions the system understands

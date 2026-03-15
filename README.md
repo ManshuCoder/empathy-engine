@@ -84,20 +84,24 @@ empathy-engine/
 ### 1. HuggingFace Inference API — Emotion Detection
 
 - **Model**: [`j-hartmann/emotion-english-distilroberta-base`](https://huggingface.co/j-hartmann/emotion-english-distilroberta-base)
-- **Endpoint**: `POST https://api-inference.huggingface.co/models/j-hartmann/emotion-english-distilroberta-base`
+- **Client**: `huggingface_hub.InferenceClient` (routed via `router.huggingface.co/hf-inference`)
 - **Output**: 7 probability scores — `anger`, `disgust`, `fear`, `joy`, `neutral`, `sadness`, `surprise`
 - **Normalised to**: 5 canonical labels — `happy`, `sad`, `angry`, `concerned`, `neutral`
 
+> **Note**: The legacy `api-inference.huggingface.co` endpoint was deprecated in 2024/2025
+> and now returns **410 Gone**. This project uses `huggingface_hub.InferenceClient`
+> which targets the current `router.huggingface.co/hf-inference` endpoint.
+
 ```python
-# Example request
-headers = {"Authorization": "Bearer <HF_API_KEY>"}
-payload = {
-    "inputs": "I can't believe this happened. I'm devastated.",
-    "parameters": {"return_all_scores": True},
-    "options": {"wait_for_model": True}
-}
-response = requests.post(HF_INFERENCE_URL, headers=headers, json=payload)
-# → [{"label": "sadness", "score": 0.87}, ...]
+# Using the new InferenceClient (huggingface_hub >= 0.23.0)
+from huggingface_hub import InferenceClient
+client = InferenceClient(
+    model="j-hartmann/emotion-english-distilroberta-base",
+    token="<HF_API_KEY>",
+    provider="hf-inference",
+)
+results = client.text_classification("I can't believe this happened. I'm devastated.")
+# → [ClassificationOutput(label='sadness', score=0.87), ...]
 ```
 
 ### 2. ElevenLabs API — Voice Synthesis
@@ -255,7 +259,8 @@ Interactive Swagger UI for all endpoints.
 |---------|---------|
 | `fastapi` | Web framework |
 | `uvicorn` | ASGI server |
-| `requests` | HuggingFace + ElevenLabs HTTP calls |
+| `requests` | ElevenLabs HTTP calls |
+| `huggingface_hub` | HuggingFace InferenceClient (new endpoint) |
 | `python-dotenv` | .env loading |
 | `gtts` | Free Google TTS fallback |
 | `pyttsx3` | Offline TTS fallback |

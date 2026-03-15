@@ -11,6 +11,9 @@ python-multipart==0.0.9
 # HTTP client (HuggingFace API + ElevenLabs API calls)
 requests>=2.31.0
 
+# HuggingFace Hub – InferenceClient (replaces deprecated api-inference.huggingface.co)
+huggingface_hub>=0.23.0
+
 # gTTS fallback (Google Translate TTS – free, requires internet)
 gtts==2.5.1
 
